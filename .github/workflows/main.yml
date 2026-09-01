@@ -6,7 +6,6 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-
     steps:
       - name: Configure Core RDP Settings
         run: |
@@ -17,11 +16,11 @@ jobs:
                              -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
-
+          
           # Configure firewall for RDP
           netsh advfirewall firewall delete rule name="RDP-Tailscale" >$null 2>&1
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
+          
           # Restart the Remote Desktop service
           Restart-Service -Name TermService -Force
 
@@ -29,61 +28,117 @@ jobs:
         run: |
           $password = "Amirali.138800"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # حذف کاربر قبلی اگر وجود داشته باشد
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          
           New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           
           echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "User RDP created successfully"
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          $installerPath = "$env:TEMP\tailscale-setup.exe"
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", $installerPath, "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          Write-Host "Downloading Tailscale..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UseBasicParsing
           
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" version
+          Write-Host "Installing Tailscale..."
+          Start-Process -FilePath $installerPath -ArgumentList "/quiet", "/norestart" -Wait -NoNewWindow
+          
+          # صبر کن تا نصب کامل بشه
+          Start-Sleep -Seconds 15
+          
+          # پیدا کردن مسیر tailscale.exe
+          $possiblePaths = @(
+            "$env:ProgramFiles\Tailscale\tailscale.exe",
+            "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe",
+            "$env:LOCALAPPDATA\Tailscale\tailscale.exe"
+          )
+          
+          $tailscaleExe = $null
+          foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+              $tailscaleExe = $path
+              break
+            }
+          }
+          
+          if (-not $tailscaleExe) {
+            Write-Host "Searching for tailscale.exe..."
+            $found = Get-ChildItem -Path "C:\Program Files","C:\Program Files (x86)" -Recurse -Filter "tailscale.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              $tailscaleExe = $found.FullName
+            }
+          }
+          
+          if (-not $tailscaleExe) {
+            Write-Error "Tailscale executable not found after installation"
+            exit 1
+          }
+          
+          Write-Host "Tailscale found at: $tailscaleExe"
+          & $tailscaleExe version
+          
+          echo "TAILSCALE_EXE=$tailscaleExe" >> $env:GITHUB_ENV
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tailscale = $env:TAILSCALE_EXE
+          
+          Write-Host "Connecting to Tailscale..."
+          & $tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes
           
           # Wait for IP
           $tsIP = $null
-          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          for ($i = 0; $i -lt 20; $i++) {
+              $tsIP = & $tailscale ip -4 2>$null
+              if ($tsIP -and $tsIP -match '\d+\.\d+\.\d+\.\d+') {
+                  break
+              }
+              Write-Host "Waiting for Tailscale IP... attempt $($i+1)"
               Start-Sleep -Seconds 5
           }
           
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned"
+              & $tailscale status
               exit 1
           }
+          
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP assigned: $tsIP"
 
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          
+          Write-Host "TCP connectivity to port 3389 successful!"
 
       - name: Keep Runner Alive
         if: always()
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "==================`n"
+          Write-Host "`n========================================"
+          Write-Host "===          RDP ACCESS            ==="
+          Write-Host "========================================"
+          Write-Host "Address  : $env:TAILSCALE_IP"
+          Write-Host "Username : RDP"
+          Write-Host "Password : $env:RDP_PASSWORD"
+          Write-Host "========================================`n"
           
-          # Infinite loop to keep runner alive until timeout/cancel
+          # Infinite loop to keep runner alive
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP session active"
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP session is active..."
               Start-Sleep -Seconds 600
           }
