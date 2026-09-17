@@ -1,4 +1,3 @@
-```yaml
 name: Windows RDP
 
 on:
@@ -545,4 +544,3 @@ jobs:
 
               Start-Sleep -Seconds 600
           }
-```
