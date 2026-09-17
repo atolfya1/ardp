@@ -72,71 +72,76 @@ jobs:
           Write-Host "RDP port: 3389"
           Write-Host "Allowed source: Tailscale 100.64.0.0/10"
 
-      # ============================================================
-      # 2. Create RDP User
-      # ============================================================
-      - name: Create RDP User
-        shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          Write-Host "========================================"
-          Write-Host "          CREATING RDP USER"
-          Write-Host "========================================"
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              throw "RDP_PASSWORD secret is not configured."
-          }
-
-          $securePass = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
-
-          # Remove previous RDP user if present
-          $existingUser = Get-LocalUser `
-            -Name "RDP" `
-            -ErrorAction SilentlyContinue
-
-          if ($existingUser) {
-              Remove-LocalUser `
+          # ============================================================
+          # 2. Create RDP User
+          # ============================================================
+          - name: Create RDP User
+            shell: powershell
+            env:
+              RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+            run: |
+              $ErrorActionPreference = "Stop"
+          
+              Write-Host "========================================"
+              Write-Host "          CREATING RDP USER"
+              Write-Host "========================================"
+          
+              if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+                  throw "RDP_PASSWORD secret is not configured."
+              }
+          
+              $securePass = ConvertTo-SecureString `
+                $env:RDP_PASSWORD `
+                -AsPlainText `
+                -Force
+          
+              # Remove previous user if it exists
+              $existingUser = Get-LocalUser `
                 -Name "RDP" `
                 -ErrorAction SilentlyContinue
-
-              Start-Sleep -Seconds 2
-          }
-
-          # Create user
-          New-LocalUser `
-            -Name "RDP" `
-            -Password $securePass `
-            -AccountNeverExpires `
-            -PasswordNeverExpires `
-            -UserMayNotChangePassword `
-            -Description "Temporary RDP user for this GitHub Actions runner" `
-            -ErrorAction Stop
-
-          # Administrators
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "RDP" `
-            -ErrorAction SilentlyContinue
-
-          # Remote Desktop Users
-          Add-LocalGroupMember `
-            -Group "Remote Desktop Users" `
-            -Member "RDP" `
-            -ErrorAction SilentlyContinue
-
-          # Verify user
-          $user = Get-LocalUser -Name "RDP" -ErrorAction Stop
-
-          Write-Host ""
-          Write-Host "RDP user created successfully."
-          Write-Host "Username: RDP"
-          Write-Host "Enabled: $($user.Enabled)"
+          
+              if ($existingUser) {
+                  Write-Host "Removing existing RDP user..."
+          
+                  Remove-LocalUser `
+                    -Name "RDP" `
+                    -ErrorAction SilentlyContinue
+          
+                  Start-Sleep -Seconds 2
+              }
+          
+              # Create RDP user
+              New-LocalUser `
+                -Name "RDP" `
+                -Password $securePass `
+                -AccountNeverExpires `
+                -PasswordNeverExpires `
+                -UserMayNotChangePassword `
+                -Description "Temporary GitHub RDP user" `
+                -ErrorAction Stop
+          
+              # Add to Administrators
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member "RDP" `
+                -ErrorAction SilentlyContinue
+          
+              # Add to Remote Desktop Users
+              Add-LocalGroupMember `
+                -Group "Remote Desktop Users" `
+                -Member "RDP" `
+                -ErrorAction SilentlyContinue
+          
+              # Verify user
+              $user = Get-LocalUser `
+                -Name "RDP" `
+                -ErrorAction Stop
+          
+              Write-Host ""
+              Write-Host "RDP user created successfully."
+              Write-Host "Username: RDP"
+              Write-Host "Enabled: $($user.Enabled)"
+              Write-Host "========================================"
 
       # ============================================================
       # 3. Install Tailscale
