@@ -1,4 +1,3 @@
-```yaml
 name: Windows RDP
 
 on:
@@ -519,4 +518,3 @@ jobs:
               Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner active..."
               Start-Sleep -Seconds 600
           }
-```
