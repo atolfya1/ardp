@@ -1,4 +1,5 @@
-name: RDP
+```yaml
+name: Windows RDP
 
 on:
   workflow_dispatch:
@@ -15,8 +16,10 @@ jobs:
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "========================================"
-          Write-Host "Configuring Remote Desktop"
+          Write-Host "      CONFIGURING WINDOWS RDP"
           Write-Host "========================================"
 
           # Enable Remote Desktop
@@ -26,26 +29,26 @@ jobs:
             -Value 0 `
             -Force
 
-          # Keep Network Level Authentication enabled
+          # Enable Network Level Authentication
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" `
             -Value 1 `
             -Force
 
-          # Use standard RDP security
+          # Standard RDP security
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "SecurityLayer" `
             -Value 1 `
             -Force
 
-          # Remove previous firewall rule
+          # Remove old custom firewall rule if it exists
           netsh advfirewall firewall delete rule `
             name="RDP-Tailscale" `
             >$null 2>&1
 
-          # Allow RDP only from the Tailscale IPv4 range
+          # Allow RDP only from Tailscale IPv4 range
           netsh advfirewall firewall add rule `
             name="RDP-Tailscale" `
             dir=in `
@@ -57,8 +60,18 @@ jobs:
           # Restart RDP service
           Restart-Service -Name TermService -Force
 
-          Write-Host "RDP configuration completed."
+          # Make sure RDP service is running
+          $rdpService = Get-Service -Name TermService
 
+          if ($rdpService.Status -ne "Running") {
+              throw "Remote Desktop service is not running."
+          }
+
+          Write-Host ""
+          Write-Host "RDP configuration completed successfully."
+          Write-Host "RDP service status: $($rdpService.Status)"
+          Write-Host "RDP port: 3389"
+          Write-Host "Allowed source: Tailscale 100.64.0.0/10"
 
       # ============================================================
       # 2. Create RDP User
@@ -68,46 +81,63 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========================================"
+          Write-Host "          CREATING RDP USER"
+          Write-Host "========================================"
 
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-              Write-Error "RDP_PASSWORD secret is not configured."
-              exit 1
+              throw "RDP_PASSWORD secret is not configured."
           }
-
-          Write-Host "Creating RDP user..."
 
           $securePass = ConvertTo-SecureString `
             $env:RDP_PASSWORD `
             -AsPlainText `
             -Force
 
-          # Remove existing user
-          Remove-LocalUser `
+          # Remove previous RDP user if present
+          $existingUser = Get-LocalUser `
             -Name "RDP" `
             -ErrorAction SilentlyContinue
 
-          # Create new user
+          if ($existingUser) {
+              Remove-LocalUser `
+                -Name "RDP" `
+                -ErrorAction SilentlyContinue
+
+              Start-Sleep -Seconds 2
+          }
+
+          # Create user
           New-LocalUser `
             -Name "RDP" `
             -Password $securePass `
             -AccountNeverExpires `
             -PasswordNeverExpires `
+            -UserMayNotChangePassword `
+            -Description "Temporary RDP user for this GitHub Actions runner" `
             -ErrorAction Stop
 
-          # Administrator access
+          # Administrators
           Add-LocalGroupMember `
             -Group "Administrators" `
             -Member "RDP" `
             -ErrorAction SilentlyContinue
 
-          # RDP access
+          # Remote Desktop Users
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -Member "RDP" `
             -ErrorAction SilentlyContinue
 
-          Write-Host "RDP user created successfully."
+          # Verify user
+          $user = Get-LocalUser -Name "RDP" -ErrorAction Stop
 
+          Write-Host ""
+          Write-Host "RDP user created successfully."
+          Write-Host "Username: RDP"
+          Write-Host "Enabled: $($user.Enabled)"
 
       # ============================================================
       # 3. Install Tailscale
@@ -115,26 +145,41 @@ jobs:
       - name: Install Tailscale
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
 
           Write-Host "========================================"
-          Write-Host "Installing Tailscale"
+          Write-Host "          INSTALLING TAILSCALE"
           Write-Host "========================================"
 
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
           $installerPath = "$env:TEMP\tailscale-setup.exe"
+
+          Write-Host "Downloading Tailscale..."
 
           Invoke-WebRequest `
             -Uri $tsUrl `
             -OutFile $installerPath `
             -UseBasicParsing
 
-          Start-Process `
+          if (-not (Test-Path $installerPath)) {
+              throw "Tailscale installer was not downloaded."
+          }
+
+          Write-Host "Installing Tailscale..."
+
+          $process = Start-Process `
             -FilePath $installerPath `
             -ArgumentList "/quiet", "/norestart" `
             -Wait `
+            -PassThru `
             -NoNewWindow
 
-          Start-Sleep -Seconds 15
+          if ($process.ExitCode -ne 0) {
+              throw "Tailscale installer failed with exit code $($process.ExitCode)."
+          }
+
+          # Give Windows service time to start
+          Start-Sleep -Seconds 10
 
           $possiblePaths = @(
             "$env:ProgramFiles\Tailscale\tailscale.exe",
@@ -151,12 +196,12 @@ jobs:
               }
           }
 
+          # Fallback search
           if (-not $tailscaleExe) {
-
               Write-Host "Searching for tailscale.exe..."
 
               $found = Get-ChildItem `
-                -Path "C:\Program Files","C:\Program Files (x86)" `
+                -Path "C:\Program Files", "C:\Program Files (x86)" `
                 -Recurse `
                 -Filter "tailscale.exe" `
                 -ErrorAction SilentlyContinue |
@@ -168,10 +213,10 @@ jobs:
           }
 
           if (-not $tailscaleExe) {
-              Write-Error "tailscale.exe was not found."
-              exit 1
+              throw "tailscale.exe was not found."
           }
 
+          Write-Host ""
           Write-Host "Tailscale executable:"
           Write-Host $tailscaleExe
 
@@ -179,98 +224,128 @@ jobs:
           Write-Host "Tailscale version:"
           & $tailscaleExe version
 
-          echo "TAILSCALE_EXE=$tailscaleExe" >> $env:GITHUB_ENV
+          if ($LASTEXITCODE -ne 0) {
+              throw "Unable to execute tailscale.exe."
+          }
 
+          # Store for following steps
+          "TAILSCALE_EXE=$tailscaleExe" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+
+          Write-Host ""
+          Write-Host "Tailscale installation completed."
 
       # ============================================================
-      # 4. Authenticate Tailscale + Advertise Exit Node
+      # 4. Authenticate + Advertise Exit Node
       # ============================================================
       - name: Establish Tailscale Connection
         shell: powershell
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          $ErrorActionPreference = "Stop"
 
           $tailscale = $env:TAILSCALE_EXE
 
+          if ([string]::IsNullOrWhiteSpace($tailscale)) {
+              throw "TAILSCALE_EXE is not available."
+          }
+
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-              Write-Error "TAILSCALE_AUTH_KEY secret is not configured."
-              exit 1
+              throw "TAILSCALE_AUTH_KEY secret is not configured."
           }
 
           Write-Host "========================================"
-          Write-Host "Connecting to Tailscale"
+          Write-Host "       CONNECTING TO TAILSCALE"
           Write-Host "========================================"
 
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+
+          Write-Host "Hostname: $hostname"
+
+          # Authenticate
           & $tailscale up `
             --auth-key=$env:TAILSCALE_AUTH_KEY `
-            --hostname="gh-runner-$env:GITHUB_RUN_ID" `
+            --hostname="$hostname" `
             --accept-routes `
             --accept-dns=true `
             --unattended=true `
             --advertise-exit-node
 
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale connection failed."
-              exit 1
+          $upExitCode = $LASTEXITCODE
+
+          if ($upExitCode -ne 0) {
+              Write-Host ""
+              Write-Host "Tailscale up failed."
+              Write-Host "Exit code: $upExitCode"
+
+              Write-Host ""
+              Write-Host "Current Tailscale status:"
+              & $tailscale status
+
+              throw "Tailscale authentication failed."
           }
 
+          Write-Host ""
           Write-Host "Tailscale authentication successful."
 
-          # Explicitly enable Exit Node advertisement
+          # Explicitly advertise as exit node
           & $tailscale set --advertise-exit-node=true
 
           if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to advertise Exit Node."
-              exit 1
+              Write-Warning "Unable to explicitly set advertise-exit-node."
+              Write-Warning "Continuing because tailscale up already requested it."
           }
-
-          Write-Host "Exit Node advertisement enabled."
 
           # Wait for Tailscale IP
           $tsIP = $null
 
-          for ($i = 0; $i -lt 30; $i++) {
+          for ($i = 1; $i -le 30; $i++) {
 
-              $tsIP = (& $tailscale ip -4 2>$null | Out-String).Trim()
+              $rawIP = (& $tailscale ip -4 2>$null | Out-String).Trim()
 
-              if ($tsIP -and $tsIP -match '^\d+\.\d+\.\d+\.\d+$') {
+              if ($rawIP -match '\b100\.\d{1,3}\.\d{1,3}\.\d{1,3}\b') {
+                  $tsIP = $Matches[0]
                   break
               }
 
-              Write-Host "Waiting for Tailscale IP... $($i + 1)/30"
-
-              Start-Sleep -Seconds 3
+              Write-Host "Waiting for Tailscale IP... $i/30"
+              Start-Sleep -Seconds 2
           }
 
           if (-not $tsIP) {
-
-              Write-Error "Tailscale IP was not assigned."
 
               Write-Host ""
               Write-Host "Tailscale status:"
               & $tailscale status
 
-              exit 1
+              throw "Tailscale IP was not assigned."
           }
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          # Save IP for following steps
+          "TAILSCALE_IP=$tsIP" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
           Write-Host ""
           Write-Host "========================================"
-          Write-Host "Tailscale connected"
-          Write-Host "Tailscale IP: $tsIP"
-          Write-Host "Exit Node: ADVERTISED"
+          Write-Host "       TAILSCALE CONNECTION READY"
+          Write-Host "========================================"
+          Write-Host "Tailscale IP : $tsIP"
+          Write-Host "Hostname     : $hostname"
+          Write-Host "Exit Node    : ADVERTISED"
           Write-Host "========================================"
 
-
       # ============================================================
-      # 5. Network / DERP Diagnostics
+      # 5. Tailscale Diagnostics
       # ============================================================
-      - name: Tailscale Network Diagnostics
+      - name: Tailscale Diagnostics
         shell: powershell
+        continue-on-error: true
         run: |
-
           $tailscale = $env:TAILSCALE_EXE
 
           Write-Host ""
@@ -281,67 +356,131 @@ jobs:
           Write-Host ""
           Write-Host "===== TAILSCALE IP ====="
           & $tailscale ip -4
-
-          Write-Host ""
-          Write-Host "===== TAILSCALE NETCHECK ====="
-          & $tailscale netcheck
+          Write-Host "Exit code: $LASTEXITCODE"
 
           Write-Host ""
           Write-Host "===== TAILSCALE STATUS ====="
           & $tailscale status
+          Write-Host "Exit code: $LASTEXITCODE"
+
+          Write-Host ""
+          Write-Host "===== TAILSCALE NETCHECK ====="
+          & $tailscale netcheck
+          Write-Host "Exit code: $LASTEXITCODE"
 
           Write-Host ""
           Write-Host "===== TAILSCALE EXIT NODE ====="
           & $tailscale exit-node list
+          Write-Host "Exit code: $LASTEXITCODE"
 
           Write-Host ""
           Write-Host "========================================"
-          Write-Host "Diagnostics completed"
+          Write-Host "       DIAGNOSTICS FINISHED"
           Write-Host "========================================"
 
+          # Diagnostics must NEVER fail the workflow
+          exit 0
 
       # ============================================================
-      # 6. Verify Tailscale IP + RDP
+      # 6. Verify Tailscale Interface
       # ============================================================
-      - name: Verify RDP Accessibility
+      - name: Verify Tailscale Connection
         shell: powershell
         run: |
+          $ErrorActionPreference = "Stop"
 
-          Write-Host ""
+          $tailscale = $env:TAILSCALE_EXE
+          $tsIP = $env:TAILSCALE_IP
+
           Write-Host "========================================"
-          Write-Host "Testing RDP"
+          Write-Host "       VERIFYING TAILSCALE"
           Write-Host "========================================"
 
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          if ([string]::IsNullOrWhiteSpace($tsIP)) {
+              throw "TAILSCALE_IP is empty."
+          }
 
-          $testResult = Test-NetConnection `
-            -ComputerName $env:TAILSCALE_IP `
-            -Port 3389 `
-            -WarningAction SilentlyContinue
+          Write-Host "Tailscale IP: $tsIP"
 
-          if (-not $testResult.TcpTestSucceeded) {
+          # Verify the IP is actually assigned to a local interface
+          $localIPs = Get-NetIPAddress `
+            -AddressFamily IPv4 `
+            -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty IPAddress
 
-              Write-Error "TCP connection to RDP port 3389 failed."
-
+          if ($localIPs -notcontains $tsIP) {
               Write-Host ""
-              Write-Host "Detailed result:"
-              $testResult
+              Write-Host "Local IPv4 addresses:"
+              $localIPs | ForEach-Object {
+                  Write-Host " - $_"
+              }
 
-              exit 1
+              throw "Tailscale IP is not present on a local network interface."
           }
 
           Write-Host ""
-          Write-Host "RDP port 3389 is accessible."
-
+          Write-Host "Tailscale interface verified."
 
       # ============================================================
-      # 7. Final Information
+      # 7. Verify RDP Service + Port
+      # ============================================================
+      - name: Verify RDP Service
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========================================"
+          Write-Host "          VERIFYING RDP"
+          Write-Host "========================================"
+
+          # Check service
+          $rdpService = Get-Service -Name TermService -ErrorAction Stop
+
+          Write-Host "TermService status: $($rdpService.Status)"
+
+          if ($rdpService.Status -ne "Running") {
+              throw "Remote Desktop service is not running."
+          }
+
+          # Check listening socket
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+              Write-Host ""
+              Write-Host "Current listeners on port 3389:"
+              Get-NetTCPConnection `
+                -LocalPort 3389 `
+                -ErrorAction SilentlyContinue
+
+              throw "RDP is not listening on TCP port 3389."
+          }
+
+          Write-Host ""
+          Write-Host "RDP is listening on TCP 3389."
+
+          # Firewall rule
+          Write-Host ""
+          Write-Host "RDP-Tailscale firewall rule:"
+
+          Get-NetFirewallRule `
+            -DisplayName "RDP-Tailscale" `
+            -ErrorAction SilentlyContinue |
+            Format-Table `
+              DisplayName,
+              Enabled,
+              Direction,
+              Action
+
+      # ============================================================
+      # 8. Final Information
       # ============================================================
       - name: Display Access Information
         if: success()
         shell: powershell
         run: |
-
           Write-Host ""
           Write-Host "========================================"
           Write-Host "          RDP ACCESS INFORMATION"
@@ -352,19 +491,17 @@ jobs:
           Write-Host "Username     : RDP"
           Write-Host "Password     : GitHub Secret RDP_PASSWORD"
           Write-Host ""
-          Write-Host "Exit Node    : ENABLED / ADVERTISED"
+          Write-Host "Exit Node    : ADVERTISED"
           Write-Host ""
           Write-Host "========================================"
 
-
       # ============================================================
-      # 8. Keep Runner Alive
+      # 9. Keep Runner Alive
       # ============================================================
       - name: Keep Runner Alive
         if: success()
         shell: powershell
         run: |
-
           Write-Host ""
           Write-Host "========================================"
           Write-Host "          RUNNER IS ACTIVE"
@@ -373,14 +510,13 @@ jobs:
           Write-Host "Tailscale IP : $env:TAILSCALE_IP"
           Write-Host "RDP Port     : 3389"
           Write-Host "Username     : RDP"
-          Write-Host "Exit Node    : ENABLED"
+          Write-Host "Exit Node    : ENABLED / ADVERTISED"
           Write-Host ""
           Write-Host "========================================"
           Write-Host ""
 
           while ($true) {
-
               Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner active..."
-
               Start-Sleep -Seconds 600
           }
+```
